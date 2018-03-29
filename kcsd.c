@@ -177,7 +177,7 @@ int main(int argc, char* argv[])
      * form /dev/ipmi-kcsX, so we want to extract the 'kcsX' bit for use in the
      * object name and bus name */
     kcsDevname = strstr(driverPath, "-kcs");
-    if(kcsDevname)
+    if(!kcsDevname)
     {
         /* Invalid path */
         printf("Pathname \"%s\" is not a valid driver path\n", driverPath);
