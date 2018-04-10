@@ -45,7 +45,7 @@
 #define FD_COUNT                    3
 
 /** Maximum length of a KCS message */
-#define KCS_MAX_MESSAGE_LEN         64
+#define KCS_MAX_MESSAGE_LEN         128
 
 /** Interface name to register our methods and signals with */
 #define INTERFACE_NAME              "org.openbmc.HostIpmi"
