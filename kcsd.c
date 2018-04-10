@@ -198,7 +198,6 @@ int main(int argc, char* argv[])
     snprintf(context.busName, sizeof(context.busName),
              BUS_NAME_FMT, kcsDevname + 1);
 
-    DEBUG_PRINT("Getting system bus\n");
     ret = sd_bus_default_system(&context.pBus);
     if(ret < 0)
     {
@@ -207,7 +206,6 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    DEBUG_PRINT("Registering message and signal handlers\n");
     ret = sd_bus_add_object_vtable(context.pBus,
                                    NULL,
                                    context.objName,
@@ -234,7 +232,6 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    DEBUG_PRINT("Getting dbus fd\n");
     context.fds[SD_BUS_FD].fd = sd_bus_get_fd(context.pBus);
     if(context.fds[SD_BUS_FD].fd < 0)
     {
@@ -255,7 +252,6 @@ int main(int argc, char* argv[])
         return -errno;
     }
 
-    DEBUG_PRINT("Creating timer fd\n");
     context.fds[TIMER_FD].fd = timerfd_create(CLOCK_MONOTONIC, 0);
     if(context.fds[TIMER_FD].fd < 0)
     {
