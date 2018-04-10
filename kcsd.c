@@ -36,9 +36,13 @@
 #include <sys/timerfd.h>
 #include <time.h>
 #include <errno.h>
+#include <getopt.h>
 #include <libgen.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <syslog.h>
+#include <stdlib.h>
+#include <stdarg.h>
 
 #include <systemd/sd-bus.h>
 
@@ -88,6 +92,12 @@
 /** Timeout in seconds used for KCS responses */
 #define KCS_TIMEOUT_SECONDS         5
 
+/** Log message prefix for the KCS Daemon */
+#define KCSD_PREFIX                 "KCSD"
+
+/** Length of the log buffer to use */
+#define LOG_BUFFER_LEN              512
+
 /** Structure containing the parameters of a message */
 typedef struct _MsgEntry_s
 {
@@ -120,16 +130,26 @@ typedef struct _KcsdContext_s
     int             awaitingResponse;
 }KcsdContext_t;
 
-#ifdef DEBUG_KCSD
-#define DEBUG_PRINT(__fmt, ...) \
-    do { printf(__fmt, ## __VA_ARGS__); } while (0)
-#else
-#define DEBUG_PRINT(__fmt, ...)
-#endif
+#define MSG_OUT(f_, ...) do { if (verbosity != KCS_LOG_NONE) { kcs_log(LOG_INFO, f_, ##__VA_ARGS__); } } while(0)
+#define MSG_ERR(f_, ...) do { kcs_log(LOG_ERR, f_, ##__VA_ARGS__); } while(0)
+#define MSG_WARN(f_, ...) do { kcs_log(LOG_WARNING, f_, ##__VA_ARGS__); } while(0)
 
 /*******************************************************************************
  * Private Function Prototypes
  ******************************************************************************/
+static void kcsd_usage(
+    const char*     name);
+
+static void kcs_log_console(
+    int             priority,
+    const char*     fmt,
+    va_list         args);
+
+static void kcs_log(
+    int             priority,
+    const char*     fmt,
+    ...);
+
 static int handle_dbus_events(
     KcsdContext_t*  pContext);
 
@@ -160,6 +180,19 @@ static const sd_bus_vtable kcsd_vtable[] = {
     SD_BUS_VTABLE_END
 };
 
+/** Log buffer to use when forming long messages. Declared here to avoid creating
+ *  a large buffer on the stack. This is safe as we only ever access the buffer
+ *  from a single thread */
+static char logBuffer[LOG_BUFFER_LEN] = {0};
+
+static void (*kcs_vlog)(int p, const char *fmt, va_list args);
+
+static enum {
+   KCS_LOG_NONE = 0,
+   KCS_LOG_VERBOSE,
+   KCS_LOG_DEBUG
+} verbosity;
+
 /*******************************************************************************
  * Exported Functions
  ******************************************************************************/
@@ -169,16 +202,43 @@ int main(int argc, char* argv[])
     int ret = 0;
     const char* driverPath = NULL;
     char* kcsDevname = NULL;
+    int opt = 0;
+    static const struct option long_options[] = {
+        { "v",       no_argument, (int *)&verbosity, KCS_LOG_VERBOSE },
+        { "vv",      no_argument, (int *)&verbosity, KCS_LOG_DEBUG   },
+        { "syslog",  no_argument, 0,          's'                    },
+        { 0,         0,           0,          0                      }
+    };
 
-    if(argc <= 1)
+    kcs_vlog = &kcs_log_console;
+    while ((opt = getopt_long(argc, argv, "", long_options, NULL)) != -1)
     {
-        /* Need the path to the KCS device driver */
-        printf("Please specify a path to the KCS driver instance\n");
-        return -EINVAL;
+        switch (opt) {
+            case 0:
+                break;
+            case 's':
+                /* Avoid a double openlog() */
+                if (kcs_vlog != &vsyslog) {
+                    openlog(KCSD_PREFIX, LOG_ODELAY, LOG_DAEMON);
+                    kcs_vlog = &vsyslog;
+                }
+                break;
+            default:
+                kcsd_usage(argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    if(optind < argc)
+    {
+        /* Check for the required positional argument */
+        driverPath = argv[optind];
     }
     else
     {
-        driverPath = argv[1];
+        /* Need the path to the KCS device driver */
+        MSG_ERR("Please specify a path to the KCS driver instance\n");
+        return -EINVAL;
     }
 
     /* Extract the device name from the driver path. IPMI KCS drivers are of the 
@@ -188,7 +248,7 @@ int main(int argc, char* argv[])
     if(!kcsDevname)
     {
         /* Invalid path */
-        printf("Pathname \"%s\" is not a valid driver path\n", driverPath);
+        MSG_ERR("Pathname \"%s\" is not a valid driver path\n", driverPath);
         return -EINVAL;
     }
 
@@ -201,8 +261,8 @@ int main(int argc, char* argv[])
     ret = sd_bus_default_system(&context.pBus);
     if(ret < 0)
     {
-        printf("Failed to connect to system bus (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to connect to system bus (ret: %d, errno: %d)\n",
+                ret, errno);
         return -1;
     }
 
@@ -214,8 +274,8 @@ int main(int argc, char* argv[])
                                    &context);
     if(ret < 0)
     {
-        printf("Failed to register methods and signals (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to register methods and signals (ret: %d, errno: %d)\n",
+                ret, errno);
         sd_bus_unref(context.pBus);
         return -1;
     }
@@ -226,8 +286,8 @@ int main(int argc, char* argv[])
                               SD_BUS_NAME_REPLACE_EXISTING);
     if(ret < 0)
     {
-        printf("Failed to acquire name %s (ret: %d, errno: %d)\n",
-               context.busName, ret, errno);
+        MSG_ERR("Failed to acquire name %s (ret: %d, errno: %d)\n",
+                context.busName, ret, errno);
         sd_bus_unref(context.pBus);
         return -1;
     }
@@ -235,19 +295,19 @@ int main(int argc, char* argv[])
     context.fds[SD_BUS_FD].fd = sd_bus_get_fd(context.pBus);
     if(context.fds[SD_BUS_FD].fd < 0)
     {
-        printf("Failed to get dbus file descriptor (ret: %d, errno: %d)",
-               context.fds[SD_BUS_FD].fd, errno);
+        MSG_ERR("Failed to get dbus file descriptor (ret: %d, errno: %d)",
+                context.fds[SD_BUS_FD].fd, errno);
         sd_bus_unref(context.pBus);
         return -1;
     }
 
-    DEBUG_PRINT("Opening driver @ %s\n",
-                driverPath);
+    MSG_OUT("Opening driver @ %s\n",
+            driverPath);
     context.fds[KCS_DEV_FD].fd = open(driverPath, O_RDWR);
     if(context.fds[KCS_DEV_FD].fd < 0)
     {
-        printf("Failed to open device @ %s (ret: %d, errno: %d)\n",
-               driverPath, context.fds[KCS_DEV_FD].fd, errno);
+        MSG_ERR("Failed to open device @ %s (ret: %d, errno: %d)\n",
+                driverPath, context.fds[KCS_DEV_FD].fd, errno);
         sd_bus_unref(context.pBus);
         return -errno;
     }
@@ -255,7 +315,7 @@ int main(int argc, char* argv[])
     context.fds[TIMER_FD].fd = timerfd_create(CLOCK_MONOTONIC, 0);
     if(context.fds[TIMER_FD].fd < 0)
     {
-        printf("Failed to create timer fd (ret: %d, errno: %d)\n", ret, errno);
+        MSG_ERR("Failed to create timer fd (ret: %d, errno: %d)\n", ret, errno);
         return -errno;
     }
 
@@ -263,14 +323,12 @@ int main(int argc, char* argv[])
     context.fds[KCS_DEV_FD].events = POLLIN;
     context.fds[TIMER_FD].events = POLLIN;
 
-    DEBUG_PRINT("Polling...\n");
-
     while(1)
     {
         ret = poll(context.fds, FD_COUNT, -1);
         if(ret < 0)
         {
-            printf("Error from poll (ret: %d, errno: %d)\n", ret, errno);
+            MSG_ERR("Error from poll (ret: %d, errno: %d)\n", ret, errno);
             break;
         }
         else
@@ -278,24 +336,24 @@ int main(int argc, char* argv[])
             ret = handle_dbus_events(&context);
             if(ret < 0)
             {
-                printf("Error handling dbus events (ret: %d, errno: %d)\n",
-                       ret, errno);
+                MSG_ERR("Error handling dbus events (ret: %d, errno: %d)\n",
+                        ret, errno);
                 break;
             }
 
             ret = handle_kcs_events(&context);
             if(ret < 0)
             {
-                printf("Error handling kcs events (ret: %d, errno: %d)\n",
-                       ret, errno);
+                MSG_ERR("Error handling kcs events (ret: %d, errno: %d)\n",
+                        ret, errno);
                 break;
             }
 
             ret = handle_timer_events(&context);
             if(ret < 0)
             {
-                printf("Error handling timer events (ret: %d, errno: %d)\n",
-                       ret, errno);
+                MSG_ERR("Error handling timer events (ret: %d, errno: %d)\n",
+                        ret, errno);
                 break;
             }
         }
@@ -311,6 +369,64 @@ int main(int argc, char* argv[])
 /*******************************************************************************
  * Private Functions
  ******************************************************************************/
+/**
+ * Display usage information for the daemon
+ * 
+ * @param[in]       name        Name of the executable
+ */
+static void kcsd_usage(
+    const char*     name)
+{
+	fprintf(stderr,
+            "Usage %s [--v[v] | --syslog] [-d <DEVICE>]\n"
+            "  --v                    Be verbose\n"
+            "  --vv                   Be verbose and dump entire messages\n"
+            "  -s, --syslog           Log output to syslog (pointless without --verbose)\n",
+	        name);
+}
+
+/**
+ * Log a message via the console
+ * 
+ * @param[in]       priority    Priority of the message (compatible with syslog)
+ * @param[in]       fmt         The format of the message
+ * @param[in]       args        Variadic arguments to supply the format
+ */
+static void kcs_log_console(
+    int             priority,
+    const char*     fmt,
+    va_list         args)
+{
+    struct timespec time;
+    FILE *s = (priority < LOG_WARNING) ? stdout : stderr;
+
+    clock_gettime(CLOCK_REALTIME, &time);
+
+    fprintf(s, "[%s %ld.%.9ld] ", KCSD_PREFIX, time.tv_sec, time.tv_nsec);
+
+    vfprintf(s, fmt, args);
+}
+
+/**
+ * Log a message via the selected interface
+ * 
+ * @param[in]       priority    Priority of the message (compatible with syslog)
+ * @param[in]       fmt         The format of the message
+ * @param[in]       ...         Variadic arguments to supply the format
+ */
+__attribute__((format(printf, 2, 3)))
+static void kcs_log(
+    int             priority,
+    const char*     fmt,
+    ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    kcs_vlog(priority, fmt, args);
+    va_end(args);
+}
+
 /**
  * Send a response on the KCS driver
  * 
@@ -333,7 +449,7 @@ static int kcs_send_response(
 
     if(dataLen > (KCS_MAX_MESSAGE_LEN - DATA_OFFSET_RESP))
     {
-        printf("Data length is too long\n");
+        MSG_ERR("Data length is too long\n");
         ret = -EINVAL;
     }
     else
@@ -347,32 +463,46 @@ static int kcs_send_response(
         messageData[CC_OFFSET] = cc;
         memcpy(&messageData[DATA_OFFSET_RESP], pData, dataLen);
 
-#ifdef DEBUG_KCSD_RESPONSES
-        DEBUG_PRINT("Resp --> LUN:%d, Netfn:0x%02x, Cmd:0x%02x, CC:0x%02x, Data:",
-                    pMsg->lun, pMsg->netfn, pMsg->cmd, cc);
+        if(verbosity >= KCS_LOG_VERBOSE)
         {
+            int usedlen = 0;
             uint8_t dataByte = 0;
-            for(dataByte = 0; dataByte < dataLen; ++dataByte)
+
+            usedlen += snprintf(logBuffer,
+                                LOG_BUFFER_LEN,
+                                "Resp --> LUN:%d, Netfn:0x%02x, Cmd:0x%02x, CC:0x%02x",
+                                pMsg->lun, pMsg->netfn, pMsg->cmd, cc);
+
+            if(dataLen > 0)
             {
-                DEBUG_PRINT("%02x ", pData[dataByte]);
+                usedlen += snprintf(&logBuffer[usedlen],
+                                    LOG_BUFFER_LEN - usedlen,
+                                    ", Data:");
+                for(dataByte = 0; dataByte < dataLen; ++dataByte)
+                {
+                    usedlen += snprintf(&logBuffer[usedlen],
+                                        LOG_BUFFER_LEN - usedlen,
+                                        "%02x ",
+                                        pData[dataByte]);
+                }
             }
+
+            MSG_OUT("%s\n", logBuffer);
         }
-        DEBUG_PRINT("\n");
-#endif
 
         ret = write(pContext->fds[KCS_DEV_FD].fd,
                     messageData,
                     dataLen + DATA_OFFSET_RESP);
         if(ret < 0)
         {
-            printf("Failed to write to driver (ret: %d, errno: %d)\n",
-                   ret, errno);
+            MSG_ERR("Failed to write to driver (ret: %d, errno: %d)\n",
+                    ret, errno);
             ret = -errno;
         }
         else if(ret < DATA_OFFSET_RESP)
         {
             /* Not enough data */
-            printf("Not enough data sent\n");
+            MSG_ERR("Not enough data sent\n");
             ret = -EINVAL;
         }
     }
@@ -406,8 +536,8 @@ static int send_received_message_signal(
                                     "ReceivedMessage");
     if(ret < 0)
     {
-        printf("Failed to create ReceivedMessage signal (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to create ReceivedMessage signal (ret: %d, errno: %d)\n",
+                ret, errno);
         return ret;
     }
 
@@ -418,8 +548,8 @@ static int send_received_message_signal(
                                 pMsg->cmd);
     if(ret < 0)
     {
-        printf("Failed to append parameters to signal (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to append parameters to signal (ret: %d, errno: %d)\n",
+                ret, errno);
         sd_bus_message_unref(pSignal);
         return ret;
     }
@@ -429,8 +559,8 @@ static int send_received_message_signal(
                                       dataLen);
     if(ret < 0)
     {
-        printf("Failed to append data to signal (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to append data to signal (ret: %d, errno: %d)\n",
+                ret, errno);
         sd_bus_message_unref(pSignal);
         return ret;
     }
@@ -438,8 +568,8 @@ static int send_received_message_signal(
     ret = sd_bus_send(pContext->pBus, pSignal, NULL);
     if(ret < 0)
     {
-        printf("Failed to emit signal (ret: %d, errno: %d)\n",
-               ret, errno);
+        MSG_ERR("Failed to emit signal (ret: %d, errno: %d)\n",
+                ret, errno);
     }
 
     sd_bus_message_unref(pSignal);
@@ -464,7 +594,7 @@ static int handle_dbus_events(
         ret = sd_bus_process(pContext->pBus, NULL);
         if(ret < 0)
         {
-            printf("Failed to process dbus events (ret: %d)\n", ret);
+            MSG_ERR("Failed to process dbus events (ret: %d)\n", ret);
         }
     }
 
@@ -495,13 +625,13 @@ static int handle_kcs_events(
                    sizeof(messageData));
         if(ret < 0)
         {
-            printf("Failed to read data from KCS (ret: %d, errno: %d)\n",
+            MSG_ERR("Failed to read data from KCS (ret: %d, errno: %d)\n",
                         ret, errno);
             return ret;
         }
         if(ret < DATA_OFFSET_REQ)
         {
-            printf("Not enough data read for a KCS message (ret: %d)\n",
+            MSG_ERR("Not enough data read for a KCS message (ret: %d)\n",
                    ret);
             return -1;
         }
@@ -510,7 +640,7 @@ static int handle_kcs_events(
 
         if(pContext->awaitingResponse)
         {
-            DEBUG_PRINT("Received KCS message while awaiting response. Discarding\n");
+            MSG_WARN("Received KCS message while awaiting response. Discarding\n");
         }
         else
         {
@@ -519,20 +649,33 @@ static int handle_kcs_events(
             pContext->pendingMsg.netfn = messageData[NETFN_LUN_OFFSET] >> NETFN_SHIFT;
             pContext->pendingMsg.cmd = messageData[CMD_OFFSET];
 
-#ifdef DEBUG_KCSD_REQUESTS
-            DEBUG_PRINT("Req  <-- LUN:%d, Netfn:0x%02x, Cmd:0x%02x, Data:",
-                        pContext->pendingMsg.lun,
-                        pContext->pendingMsg.netfn,
-                        pContext->pendingMsg.cmd);
+            if(verbosity >= KCS_LOG_VERBOSE)
             {
+                int usedlen = 0;
                 uint8_t dataByte = 0;
-                for(dataByte = 0; dataByte < (dataLen - DATA_OFFSET_REQ); ++dataByte)
+
+                usedlen += snprintf(logBuffer,
+                                    LOG_BUFFER_LEN,
+                                    "Req  <-- LUN:%d, Netfn:0x%02x, Cmd:0x%02x",
+                                    pContext->pendingMsg.lun,
+                                    pContext->pendingMsg.netfn,
+                                    pContext->pendingMsg.cmd);
+                if(dataLen > 0)
                 {
-                    DEBUG_PRINT("%02x ", messageData[DATA_OFFSET_REQ + dataByte]);
+                    usedlen += snprintf(&logBuffer[usedlen],
+                                        LOG_BUFFER_LEN - usedlen,
+                                        ", Data:");
+                    for(dataByte = 0; dataByte < (dataLen - DATA_OFFSET_REQ); ++dataByte)
+                    {
+                        usedlen += snprintf(&logBuffer[usedlen],
+                                            LOG_BUFFER_LEN - usedlen,
+                                            "%02x ",
+                                            messageData[DATA_OFFSET_REQ + dataByte]);
+                    }
                 }
+
+                MSG_OUT("%s\n", logBuffer);
             }
-            DEBUG_PRINT("\n");
-#endif
 
             /* Set up the timer. We do this before sending the signal to avoid
              * a race condition with the response */
@@ -543,8 +686,8 @@ static int handle_kcs_events(
             ret = timerfd_settime(pContext->fds[TIMER_FD].fd, 0, &ts, NULL);
             if(ret < 0)
             {
-                printf("Failed to set timer (ret: %d, errno: %d)\n",
-                       ret, errno);
+                MSG_ERR("Failed to set timer (ret: %d, errno: %d)\n",
+                        ret, errno);
             }
 
             ret = send_received_message_signal(pContext,
@@ -553,7 +696,8 @@ static int handle_kcs_events(
                                                dataLen - DATA_OFFSET_REQ);
             if(ret < 0)
             {
-                printf("Failed to send ReceivedMessage signal (ret: %d)\n", ret);
+                MSG_ERR("Failed to send ReceivedMessage signal (ret: %d)\n",
+                        ret);
             }
         }
     }
@@ -578,7 +722,7 @@ static int handle_timer_events(
         if(!pContext->awaitingResponse)
         {
             /* Strange, we got a timeout but weren't expecting a response */
-            DEBUG_PRINT("Timeout but no pending message\n");
+            MSG_WARN("Timeout but no pending message\n");
         }
         else
         {
@@ -598,10 +742,10 @@ static int handle_timer_events(
                                   NULL);
             if(ret < 0)
             {
-                DEBUG_PRINT("Failed to clear timer\n");
+                MSG_ERR("Failed to clear timer\n");
             }
 
-            DEBUG_PRINT("Timing out message\n");
+            MSG_WARN("Timing out message\n");
             ret = kcs_send_response(pContext,
                                     &pContext->pendingMsg,
                                     IPMI_CC_CANNOT_PROVIDE_RESP,
@@ -609,8 +753,8 @@ static int handle_timer_events(
                                     0);
             if(ret < 0)
             {
-                printf("Failed to send timeout message (ret: %d, errno: %d)\n",
-                       ret, errno);
+                MSG_ERR("Failed to send timeout message (ret: %d, errno: %d)\n",
+                        ret, errno);
             }
 
             pContext->awaitingResponse = 0;
@@ -641,14 +785,14 @@ static int kcsd_method_send_message(
     ret = sd_bus_message_new_method_return(pMsg, &pRespMsg);
     if(ret < 0)
     {
-        printf("Failed to create method response (ret: %d)\n", ret);
+        MSG_ERR("Failed to create method response (ret: %d)\n", ret);
         return ret;
     }
 
     if(!pContext->awaitingResponse)
     {
         /* We aren't expecting a response at this time */
-        printf("Response message received when in wrong state. Discarding\n");
+        MSG_WARN("Response message received when in wrong state. Discarding\n");
         ret = -EBUSY;
     }
     else
@@ -679,7 +823,7 @@ static int kcsd_method_send_message(
                                                  &cc);
         if(ret < 0)
         {
-            printf("Failed to read message parameters (ret: %d)\n", ret);
+            MSG_ERR("Failed to read message parameters (ret: %d)\n", ret);
             goto done;
         }
 
@@ -687,7 +831,7 @@ static int kcsd_method_send_message(
                                                    &dataLen);
         if(ret < 0)
         {
-            printf("Failed to read message data (ret: %d)\n", ret);
+            MSG_ERR("Failed to read message data (ret: %d)\n", ret);
             ret = -EINVAL;
             goto done;
         }
@@ -703,7 +847,7 @@ static int kcsd_method_send_message(
                               NULL);
         if(ret < 0)
         {
-            DEBUG_PRINT("Failed to clear timer\n");
+            MSG_WARN("Failed to clear timer\n");
         }
 
         ret = kcs_send_response(pContext, &resp, cc, pData, dataLen);
@@ -713,13 +857,13 @@ done:
     ret = sd_bus_message_append(pRespMsg, "x", ret);
     if(ret < 0)
     {
-        printf("Failed to add result to method (ret: %d)\n", ret);
+        MSG_ERR("Failed to add result to method (ret: %d)\n", ret);
     }
 
     ret = sd_bus_send(pContext->pBus, pRespMsg, NULL);
     if(ret < 0)
     {
-        printf("Failed to send response (ret: %d)\n", ret);
+        MSG_ERR("Failed to send response (ret: %d)\n", ret);
     }
 
     return ret;
